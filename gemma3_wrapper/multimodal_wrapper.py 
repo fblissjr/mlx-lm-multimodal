@@ -1,0 +1,77 @@
+# gemma3_wrapper/multimodal_wrapper.py
+
+import mlx.core as mx
+import mlx.nn as nn
+import numpy as np
+from mlx_lm.utils import load as load_language_model
+from transformers import AutoProcessor
+
+from gemma3_vision_components import (
+    Gemma3MultiModalProjector,
+    VisionModel,
+    load_vlm_weights,
+)
+
+class Gemma3VLM(nn.Module):
+    def __init__(self, language_model, vision_tower, projector, processor):
+        super().__init__()
+        self.language_model = language_model
+        self.vision_tower = vision_tower
+        self.projector = projector
+        self.processor = processor
+
+    def fuse_inputs(self, text_prompt: str, image):
+        inputs = self.processor(text=text_prompt, images=image, return_tensors="np", padding=True)
+        input_ids = mx.array(inputs["input_ids"])
+        pixel_values = mx.array(inputs["pixel_values"])
+
+        text_embeds = self.language_model.model.embed_tokens(input_ids)
+
+        image_features = self.vision_tower(pixel_values.transpose(0, 2, 3, 1))
+        projected_features = self.projector(image_features).astype(text_embeds.dtype)
+
+        image_token_id = self.processor.tokenizer.image_token_index # 262144
+        num_image_tokens = self.processor.image_seq_length         # 256
+
+        image_positions = np.where(input_ids.squeeze() == image_token_id)[0]
+
+        if len(image_positions) == 0:
+            return text_embeds, None # No image, no custom mask needed
+
+        pos = image_positions[0]
+
+        # Replace the placeholder embeddings with the actual image features
+        pre_image_embeds = text_embeds[:, :pos]
+        post_image_embeds = text_embeds[:, pos + num_image_tokens:]
+
+        fused_embeddings = mx.concatenate([pre_image_embeds, projected_features, post_image_embeds], axis=1)
+
+        # Create the special 4D attention mask for Gemma 3
+        # In this PoC, we'll create a simple causal mask for the new length.
+        # A production version would need the exact masking logic.
+        final_seq_len = fused_embeddings.shape[1]
+        mask = nn.MultiHeadAttention.create_additive_causal_mask(final_seq_len)
+
+        return fused_embeddings, mask
+
+
+def load_gemma3_vlm(model_path: str):
+    # Delegate to mlx-lm for the language model and tokenizer
+    language_model, tokenizer = load_language_model(model_path)
+
+    # Manually load vision components
+    config = language_model.config
+    vision_tower = VisionModel(config.vision_config)
+    projector = Gemma3MultiModalProjector(config.vision_config, config.text_config)
+
+    # Load and assign weights
+    # Note: A full implementation would load the weights into the real VisionModel.
+    # We skip this for the PoC as the dummy model has no weights to load.
+
+    # Load the full processor
+    processor = AutoProcessor.from_pretrained(model_path)
+    processor.tokenizer = tokenizer # Use the mlx-lm wrapper
+
+    # Assemble the VLM
+    vlm = Gemma3VLM(language_model, vision_tower, projector, processor)
+    return vlm
